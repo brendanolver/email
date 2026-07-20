@@ -60,9 +60,15 @@ export async function addRule(rule: string): Promise<string[]> {
 /**
  * State backing three behaviours (all added 2026-07-21, after explicit
  * approval for write access):
- *  - previousDigestMessageId: lets us delete last cycle's digest email
- *    before/after sending the new one, so exactly one digest sits in
- *    the inbox at a time.
+ *  - flagCandidateId / deleteCandidateId: a 2-cycle rotation for the
+ *    digest email itself. Flagging the digest right after sending it
+ *    was tried first and failed every time in production (~15s isn't
+ *    long enough for SMTP-out-then-back-into-IMAP latency) — instead,
+ *    each cycle flags the digest sent *last* cycle (which has now had
+ *    a full cycle, i.e. comfortably long enough, to become visible)
+ *    and deletes the one from *two* cycles ago (which was already
+ *    flagged last time round). Steady state: at most 2 digests ever
+ *    sit in the inbox, never a stale unflagged one deleted by mistake.
  *  - tracked: every inbox message we've seen, so a future run can tell
  *    whether it later vanished (deleted/moved) — read-only to compute.
  *  - senderDeletions: counts per sender, feeding the "frequently
@@ -85,7 +91,8 @@ interface SenderDeletionRecord {
 }
 
 interface DigestState {
-  previousDigestMessageId?: string;
+  flagCandidateId?: string; // sent last cycle — flag it now, it's had time to land
+  deleteCandidateId?: string; // sent 2 cycles ago — already flagged, safe to remove
   tracked: Record<string, TrackedMessage>; // key: Message-ID
   senderDeletions: Record<string, SenderDeletionRecord>; // key: normalised sender address
 }
@@ -109,14 +116,20 @@ async function writeState(state: DigestState): Promise<void> {
   await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
 }
 
-export async function getPreviousDigestMessageId(): Promise<string | undefined> {
-  const state = await readState();
-  return state.previousDigestMessageId;
+export interface DigestRotation {
+  flagCandidateId?: string;
+  deleteCandidateId?: string;
 }
 
-export async function setPreviousDigestMessageId(messageId: string): Promise<void> {
+export async function getDigestRotation(): Promise<DigestRotation> {
   const state = await readState();
-  state.previousDigestMessageId = messageId;
+  return { flagCandidateId: state.flagCandidateId, deleteCandidateId: state.deleteCandidateId };
+}
+
+export async function setDigestRotation(next: DigestRotation): Promise<void> {
+  const state = await readState();
+  state.flagCandidateId = next.flagCandidateId;
+  state.deleteCandidateId = next.deleteCandidateId;
   await writeState(state);
 }
 

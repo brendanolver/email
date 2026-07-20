@@ -17,8 +17,8 @@ import {
   recordTrackedMessages,
   diffTrackedAgainstCurrent,
   takeUnsuggestedCandidates,
-  getPreviousDigestMessageId,
-  setPreviousDigestMessageId,
+  getDigestRotation,
+  setDigestRotation,
   TRACKING_WINDOW_DAYS,
   type UnsubscribeCandidate,
 } from "./store.js";
@@ -209,29 +209,18 @@ export interface DigestAndDeliveryResult {
   deliveries: DeliveryOutcome[];
 }
 
-async function flagWithRetry(
-  account: ReturnType<typeof loadAccounts>[number],
-  mailboxPath: string,
-  messageId: string,
-  flags: string[],
-  attempts = 5,
-  delayMs = 3000
-): Promise<boolean> {
-  for (let i = 0; i < attempts; i++) {
-    const ok = await flagMessageById(account, mailboxPath, messageId, flags).catch(() => false);
-    if (ok) return true;
-    if (i < attempts - 1) await new Promise((resolve) => setTimeout(resolve, delayMs));
-  }
-  return false;
-}
-
 /**
- * Housekeeping around the digest email itself: deletes last cycle's
- * digest (by exact Message-ID, nothing else) so only one is ever
- * sitting in the inbox, flags the new one \Flagged so it stands out,
- * and cleans up Junk/Trash on both accounts. Every step here is
- * best-effort and independently logged — a failure in any one of
- * these never blocks the digest itself from having been sent.
+ * Housekeeping around the digest email itself: rotates a 2-cycle
+ * window rather than racing SMTP-to-IMAP visibility. Flagging the
+ * just-sent digest synchronously was tried first and failed every
+ * time in production — 15s of retries isn't long enough for the
+ * email to round-trip out via SMTP and back in via IMAP. Instead:
+ * flag the digest sent *last* cycle (which has now had a full cycle's
+ * worth of time, easily long enough) and delete the one from *two*
+ * cycles ago (already flagged, safe to remove). Also cleans up
+ * Junk/Trash on both accounts. Every step is best-effort and
+ * independently logged — a failure here never blocks the digest
+ * itself from having been sent.
  */
 async function runInboxHousekeeping(sentMessageId: string): Promise<void> {
   const accounts = loadAccounts();
@@ -242,18 +231,31 @@ async function runInboxHousekeeping(sentMessageId: string): Promise<void> {
     const digestLandsInOwnMailbox = recipient.toLowerCase() === icloudAccount.user.toLowerCase();
 
     if (digestLandsInOwnMailbox) {
-      const previousId = await getPreviousDigestMessageId();
-      if (previousId) {
-        const deleted = await deleteMessageById(icloudAccount, "INBOX", previousId).catch((err) => {
-          console.error("[digest] failed to delete previous digest email:", err);
+      const { flagCandidateId, deleteCandidateId } = await getDigestRotation();
+
+      if (deleteCandidateId) {
+        const deleted = await deleteMessageById(icloudAccount, "INBOX", deleteCandidateId).catch((err) => {
+          console.error("[digest] failed to delete old digest email:", err);
           return false;
         });
-        console.log(`[digest] previous digest ${deleted ? "deleted" : "not found (already gone, or delivery delayed)"}`);
+        console.log(`[digest] digest from 2 cycles ago ${deleted ? "deleted" : "not found — already gone"}`);
       }
 
-      const flagged = await flagWithRetry(icloudAccount, "INBOX", sentMessageId, ["\\Flagged"]);
-      console.log(`[digest] new digest ${flagged ? "flagged" : "could not be flagged (not visible via IMAP yet?)"}`);
-      if (flagged) await setPreviousDigestMessageId(sentMessageId);
+      let flaggedLastCycle = false;
+      if (flagCandidateId) {
+        flaggedLastCycle = await flagMessageById(icloudAccount, "INBOX", flagCandidateId, ["\\Flagged"]).catch((err) => {
+          console.error("[digest] failed to flag previous cycle's digest:", err);
+          return false;
+        });
+        console.log(
+          `[digest] previous cycle's digest ${flaggedLastCycle ? "flagged" : "still not found via IMAP — moving on regardless, will not retry"}`
+        );
+      }
+
+      // Rotate: whatever we just tried to flag becomes next cycle's
+      // delete target regardless of whether flagging succeeded — we
+      // never want to lose track of it and leak digest emails forever.
+      await setDigestRotation({ flagCandidateId: sentMessageId, deleteCandidateId: flagCandidateId });
     } else {
       console.log("[digest] DIGEST_EMAIL_TO doesn't match a connected mailbox — skipping flag/delete housekeeping.");
     }
