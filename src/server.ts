@@ -245,25 +245,37 @@ function buildMcpServer(): McpServer {
       inputSchema: {},
     },
     async () => {
-      const { digest, deliveries } = await runDigestAndDeliver();
-      const deliveryLines = deliveries
-        .map((d) => {
-          if (d.skipped) return `- ${d.channel}: skipped (not configured)`;
-          if (d.ok) return `- ${d.channel}: sent successfully`;
-          return `- ${d.channel}: FAILED — ${d.error}`;
-        })
-        .join("\n");
+      try {
+        const { digest, deliveries } = await runDigestAndDeliver();
+        const deliveryLines = deliveries
+          .map((d) => {
+            if (d.skipped) return `- ${d.channel}: skipped (not configured)`;
+            if (d.ok) return `- ${d.channel}: sent successfully`;
+            return `- ${d.channel}: FAILED — ${d.error}`;
+          })
+          .join("\n");
 
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Digest run complete. ${digest.emailCount} email(s) since ${digest.since.toISOString()}.\n\n` +
-              `Delivery status:\n${deliveryLines}\n\n${digest.text}`,
-          },
-        ],
-      };
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Digest run complete. ${digest.emailCount} email(s) since ${digest.since.toISOString()}.\n\n` +
+                `Delivery status:\n${deliveryLines}\n\n${digest.text}`,
+            },
+          ],
+        };
+      } catch (err) {
+        // Belt-and-braces: return a clean tool error instead of letting
+        // a rejection here become an unhandled one. The MCP SDK likely
+        // already handles this, but a production crash-loop is reason
+        // enough not to rely on "likely".
+        console.error("[run_digest_now] failed:", err);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Digest run failed: ${err instanceof Error ? err.message : String(err)}` }],
+        };
+      }
     }
   );
 

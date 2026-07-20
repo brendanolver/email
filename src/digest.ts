@@ -196,18 +196,31 @@ async function applyDomainRules(emails: NormalisedEmail[]): Promise<DomainRuleOu
  * actually still in each mailbox's INBOX right now (read-only diff),
  * then returns any senders that just crossed the unsubscribe
  * threshold for the first time.
+ *
+ * This whole pass is best-effort and non-fatal by design: it's a
+ * nice-to-have layered on top of the core digest, not something a
+ * transient IMAP hiccup (timeout, brief auth blip) should be able to
+ * take down the whole process for. Every other IMAP write op in this
+ * codebase is individually wrapped the same way — this one wasn't,
+ * and an unguarded rejection here is a plausible cause of a crash
+ * observed in production.
  */
 async function runDeletionTracking(): Promise<UnsubscribeCandidate[]> {
-  const accounts = loadAccounts();
-  const trackingSince = new Date(Date.now() - TRACKING_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+  try {
+    const accounts = loadAccounts();
+    const trackingSince = new Date(Date.now() - TRACKING_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
-  const currentIdsByMailbox: Partial<Record<MailboxSource, Set<string>>> = {};
-  for (const account of accounts) {
-    currentIdsByMailbox[account.source] = await listInboxMessageIds(account, trackingSince);
+    const currentIdsByMailbox: Partial<Record<MailboxSource, Set<string>>> = {};
+    for (const account of accounts) {
+      currentIdsByMailbox[account.source] = await listInboxMessageIds(account, trackingSince);
+    }
+
+    await diffTrackedAgainstCurrent(currentIdsByMailbox);
+    return await takeUnsuggestedCandidates();
+  } catch (err) {
+    console.error("[digest] deletion tracking failed — skipping unsubscribe suggestions this cycle:", err);
+    return [];
   }
-
-  await diffTrackedAgainstCurrent(currentIdsByMailbox);
-  return takeUnsuggestedCandidates();
 }
 
 export async function runDigest(): Promise<DigestResult> {
@@ -219,7 +232,12 @@ export async function runDigest(): Promise<DigestResult> {
   // Domain rules run first: auto-deleted mail is removed from the
   // mailbox and never seen again downstream (not by Claude, not by
   // tracking). auto-mark-read mail stays in the batch, just \Seen.
-  const { kept: emails, markedReadCount, deletedCount } = await applyDomainRules(rawEmails);
+  // Best-effort: a failure here falls back to treating the batch as
+  // if no domain rules applied, rather than blocking the digest.
+  const { kept: emails, markedReadCount, deletedCount } = await applyDomainRules(rawEmails).catch((err) => {
+    console.error("[digest] domain rule pass failed — skipping domain rules this cycle:", err);
+    return { kept: rawEmails, markedReadCount: 0, deletedCount: 0 };
+  });
   if (markedReadCount > 0 || deletedCount > 0) {
     console.log(`[digest] domain rules: marked ${markedReadCount} read, auto-deleted ${deletedCount}`);
   }
