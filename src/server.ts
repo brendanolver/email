@@ -1,8 +1,12 @@
 /**
- * Stage 2: MCP server exposing a single read-only tool,
- * get_emails_since, over Streamable HTTP. Deliberately minimal —
- * there is no send/delete/move/mark-read tool anywhere in this file,
- * by omission, not by a permission flag that could be misconfigured.
+ * Stage 2: MCP server exposing a small set of tools over Streamable
+ * HTTP. Originally read-only by design (get_emails_since only). As of
+ * 2026-07-21, after Brendan explicitly approved write access, two
+ * tools here (add_domain_rule / remove_domain_rule) configure
+ * deterministic mailbox actions that digest.ts and imap-write.ts
+ * actually perform — this file itself still never touches a mailbox
+ * directly, it only reads/writes the rule config those other modules
+ * consume.
  *
  * Auth: static bearer token (MCP_BEARER_TOKEN) checked with a
  * constant-time comparison. This is a deliberate simplification vs
@@ -19,7 +23,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import * as z from "zod/v4";
 import { fetchAllAccountsSince, MAX_LOOKBACK_DAYS } from "./imap.js";
-import { addRule, readRules } from "./store.js";
+import { addRule, readRules, addDomainRule, removeDomainRule, readDomainRules } from "./store.js";
 import { runDigestAndDeliver } from "./digest.js";
 import { startScheduler } from "./scheduler.js";
 
@@ -145,6 +149,85 @@ function buildMcpServer(): McpServer {
           {
             type: "text",
             text: allRules.length === 0 ? "No preference rules set yet." : allRules.map((r) => `- ${r}`).join("\n"),
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "add_domain_rule",
+    {
+      title: "Add a domain-based mailbox rule",
+      description:
+        `Adds a deterministic, code-enforced rule applied to every new email from a given domain, every digest cycle: ` +
+        `"auto-mark-read" marks matching mail \\Seen but still includes it in the digest normally; ` +
+        `"auto-delete" deletes matching mail from the mailbox immediately and excludes it from the digest entirely, ` +
+        `before Claude ever sees it. This is separate from add_preference_rule (which only ever affects how Claude ` +
+        `categorises mail) — these are hard actions on the mailbox itself, matched by exact domain, never by LLM ` +
+        `interpretation. Does NOT cover unsubscribing — that always stays a suggestion Brendan actions himself. ` +
+        `Re-adding a domain replaces its existing rule.`,
+      inputSchema: {
+        domain: z.string().describe("Domain to match, e.g. 'newsletter-domain.com' (a leading @ is fine too)"),
+        action: z
+          .enum(["auto-mark-read", "auto-delete"])
+          .describe("What to do with every new email from this domain, every cycle"),
+      },
+    },
+    async ({ domain, action }) => {
+      const rules = await addDomainRule(domain, action);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Domain rule added: ${domain} → ${action}. Current domain rules (${rules.length}):\n${rules
+              .map((r) => `- ${r.domain} → ${r.action}`)
+              .join("\n")}`,
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "remove_domain_rule",
+    {
+      title: "Remove a domain-based mailbox rule",
+      description: "Removes a previously-added domain rule, so that domain's mail goes back through normal categorisation with no mailbox-level action applied.",
+      inputSchema: {
+        domain: z.string().describe("Domain to remove, e.g. 'newsletter-domain.com'"),
+      },
+    },
+    async ({ domain }) => {
+      const rules = await removeDomainRule(domain);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Domain rule removed for ${domain}. Remaining (${rules.length}):\n${
+              rules.length ? rules.map((r) => `- ${r.domain} → ${r.action}`).join("\n") : "none"
+            }`,
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "list_domain_rules",
+    {
+      title: "List domain-based mailbox rules",
+      description:
+        "Lists the deterministic domain rules currently applied (auto-mark-read / auto-delete). Separate from list_preference_rules, which lists the free-text rules used for categorisation only.",
+      inputSchema: {},
+    },
+    async () => {
+      const rules = await readDomainRules();
+      return {
+        content: [
+          {
+            type: "text",
+            text: rules.length === 0 ? "No domain rules set yet." : rules.map((r) => `- ${r.domain} → ${r.action}`).join("\n"),
           },
         ],
       };

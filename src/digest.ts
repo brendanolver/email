@@ -19,6 +19,7 @@ import {
   takeUnsuggestedCandidates,
   getDigestRotation,
   setDigestRotation,
+  readDomainRules,
   TRACKING_WINDOW_DAYS,
   type UnsubscribeCandidate,
 } from "./store.js";
@@ -115,6 +116,80 @@ function emptyDigestResult(
   };
 }
 
+function extractDomain(from: string): string | null {
+  const angleMatch = from.match(/<([^>]+)>/);
+  const address = angleMatch ? angleMatch[1] : from;
+  const at = address.lastIndexOf("@");
+  if (at === -1) return null;
+  return address
+    .slice(at + 1)
+    .trim()
+    .toLowerCase();
+}
+
+interface DomainRuleOutcome {
+  kept: NormalisedEmail[];
+  markedReadCount: number;
+  deletedCount: number;
+}
+
+/**
+ * Applies deterministic domain rules before anything else touches
+ * the batch: auto-delete removes the message from the mailbox and
+ * excludes it from the digest entirely (Claude never sees it, and it
+ * never enters deletion-tracking — Brendan didn't delete it, we did,
+ * on his standing instruction, so it shouldn't count toward or
+ * trigger an unsubscribe suggestion for a domain he's already handled).
+ * auto-mark-read only changes the \Seen flag and leaves the email in
+ * the normal digest flow untouched.
+ */
+async function applyDomainRules(emails: NormalisedEmail[]): Promise<DomainRuleOutcome> {
+  const rules = await readDomainRules();
+  if (rules.length === 0) return { kept: emails, markedReadCount: 0, deletedCount: 0 };
+
+  const actionByDomain = new Map(rules.map((r) => [r.domain, r.action]));
+  const accountBySource = new Map(loadAccounts().map((a) => [a.source, a]));
+
+  const kept: NormalisedEmail[] = [];
+  let markedReadCount = 0;
+  let deletedCount = 0;
+
+  for (const email of emails) {
+    const domain = extractDomain(email.from);
+    const action = domain ? actionByDomain.get(domain) : undefined;
+
+    if (!action) {
+      kept.push(email);
+      continue;
+    }
+
+    const account = accountBySource.get(email.mailbox);
+    if (!account) {
+      kept.push(email); // shouldn't happen, but never silently lose an email if it does
+      continue;
+    }
+
+    if (action === "auto-delete") {
+      const deleted = await deleteMessageById(account, "INBOX", email.messageId).catch((err) => {
+        console.error(`[digest] domain rule: failed to auto-delete mail from ${domain}:`, err);
+        return false;
+      });
+      if (deleted) deletedCount++;
+      continue; // excluded from the digest either way — don't surface a half-deleted message
+    }
+
+    // action === "auto-mark-read"
+    const marked = await flagMessageById(account, "INBOX", email.messageId, ["\\Seen"]).catch((err) => {
+      console.error(`[digest] domain rule: failed to auto-mark-read mail from ${domain}:`, err);
+      return false;
+    });
+    if (marked) markedReadCount++;
+    kept.push(email);
+  }
+
+  return { kept, markedReadCount, deletedCount };
+}
+
 /**
  * Deletion-tracking pass: runs every cycle regardless of whether new
  * mail arrived. Compares what we've previously tracked against what's
@@ -139,7 +214,15 @@ export async function runDigest(): Promise<DigestResult> {
   const since = await readCheckpoint();
   const until = new Date();
 
-  const emails: NormalisedEmail[] = await fetchAllAccountsSince(since);
+  const rawEmails: NormalisedEmail[] = await fetchAllAccountsSince(since);
+
+  // Domain rules run first: auto-deleted mail is removed from the
+  // mailbox and never seen again downstream (not by Claude, not by
+  // tracking). auto-mark-read mail stays in the batch, just \Seen.
+  const { kept: emails, markedReadCount, deletedCount } = await applyDomainRules(rawEmails);
+  if (markedReadCount > 0 || deletedCount > 0) {
+    console.log(`[digest] domain rules: marked ${markedReadCount} read, auto-deleted ${deletedCount}`);
+  }
 
   // Track every email we've seen (for deletion-detection) regardless
   // of whether it ends up in this digest, then check whether anything

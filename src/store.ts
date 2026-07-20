@@ -17,6 +17,7 @@ const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
 const CHECKPOINT_FILE = path.join(DATA_DIR, "checkpoint.txt");
 const RULES_FILE = path.join(DATA_DIR, "rules.json");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
+const DOMAIN_RULES_FILE = path.join(DATA_DIR, "domain-rules.json");
 
 async function ensureDataDir(): Promise<void> {
   await fs.mkdir(DATA_DIR, { recursive: true });
@@ -54,6 +55,64 @@ export async function addRule(rule: string): Promise<string[]> {
   const rules = await readRules();
   rules.push(rule);
   await fs.writeFile(RULES_FILE, JSON.stringify(rules, null, 2), "utf-8");
+  return rules;
+}
+
+/**
+ * Domain rules are deliberately separate from the free-text preference
+ * rules above. Preference rules are interpreted by Claude and only
+ * ever affect categorisation — safe to leave loose and natural-language
+ * because nothing destructive rides on them. Domain rules trigger a
+ * real, code-enforced mailbox action (mark-read or delete) every
+ * cycle, before Claude ever sees the message, so they're matched by
+ * exact domain string in code, never by LLM interpretation.
+ */
+export type DomainRuleAction = "auto-mark-read" | "auto-delete";
+
+export interface DomainRule {
+  domain: string; // lowercase, no leading "@"
+  action: DomainRuleAction;
+  addedAt: string; // ISO
+}
+
+export async function readDomainRules(): Promise<DomainRule[]> {
+  try {
+    const raw = await fs.readFile(DOMAIN_RULES_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {
+    // no domain rules file yet
+  }
+  return [];
+}
+
+async function writeDomainRules(rules: DomainRule[]): Promise<void> {
+  await ensureDataDir();
+  await fs.writeFile(DOMAIN_RULES_FILE, JSON.stringify(rules, null, 2), "utf-8");
+}
+
+function normaliseDomain(domain: string): string {
+  return domain.trim().toLowerCase().replace(/^@/, "");
+}
+
+/** Adds a domain rule, replacing any existing rule for the same domain. */
+export async function addDomainRule(domain: string, action: DomainRuleAction): Promise<DomainRule[]> {
+  const normalised = normaliseDomain(domain);
+  const rules = await readDomainRules();
+  const existingIndex = rules.findIndex((r) => r.domain === normalised);
+  const rule: DomainRule = { domain: normalised, action, addedAt: new Date().toISOString() };
+
+  if (existingIndex >= 0) rules[existingIndex] = rule;
+  else rules.push(rule);
+
+  await writeDomainRules(rules);
+  return rules;
+}
+
+export async function removeDomainRule(domain: string): Promise<DomainRule[]> {
+  const normalised = normaliseDomain(domain);
+  const rules = (await readDomainRules()).filter((r) => r.domain !== normalised);
+  await writeDomainRules(rules);
   return rules;
 }
 
