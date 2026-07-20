@@ -18,6 +18,8 @@ export interface DigestItem {
   recommendedAction: string;
   priority: PriorityLabel;
   draftReply?: string;
+  /** Set when this item wasn't new this cycle — it's still sitting in the inbox from an earlier digest, carried forward until moved/deleted. */
+  carriedOver?: boolean;
 }
 
 export interface DigestSection {
@@ -84,11 +86,17 @@ export function renderHtml(digest: StructuredDigest): string {
                  ${escapeHtml(item.draftReply).replace(/\n/g, "<br>")}
                </div>`
             : "";
+          const carriedOverBadge = item.carriedOver
+            ? `<span style="font-size:11px;font-weight:600;color:#616161;background:#eeeeee;padding:2px 8px;border-radius:10px;white-space:nowrap;margin-left:6px;">Still outstanding</span>`
+            : "";
           return `
             <div style="padding:14px 16px;margin-bottom:10px;background:#ffffff;border-left:3px solid ${colour};border-radius:2px;box-shadow:0 1px 2px rgba(0,0,0,0.06);">
               <div style="display:flex;justify-content:space-between;align-items:baseline;">
                 <span style="font-weight:600;color:#212121;font-size:14px;">${escapeHtml(item.from)}</span>
-                <span style="font-size:11px;font-weight:600;color:#fff;background:${priorityColour};padding:2px 8px;border-radius:10px;white-space:nowrap;margin-left:8px;">${escapeHtml(item.priority)}</span>
+                <span style="white-space:nowrap;">
+                  <span style="font-size:11px;font-weight:600;color:#fff;background:${priorityColour};padding:2px 8px;border-radius:10px;white-space:nowrap;margin-left:8px;">${escapeHtml(item.priority)}</span>
+                  ${carriedOverBadge}
+                </span>
               </div>
               <div style="margin-top:6px;color:#424242;font-size:14px;line-height:1.4;">${escapeHtml(item.summary)}</div>
               <div style="margin-top:8px;font-size:13px;color:#616161;"><strong>Why it matters:</strong> ${escapeHtml(item.whyItMatters)}</div>
@@ -152,7 +160,7 @@ export function renderPlainText(digest: StructuredDigest): string {
     lines.push(`## ${section.name} (${section.items.length})`, "");
     for (const item of section.items) {
       lines.push(`From: ${item.from}`);
-      lines.push(`Priority: ${item.priority}`);
+      lines.push(`Priority: ${item.priority}${item.carriedOver ? " (still outstanding — carried over from an earlier digest)" : ""}`);
       lines.push(item.summary);
       lines.push(`Why it matters: ${item.whyItMatters}`);
       lines.push(`Next action: ${item.recommendedAction}`);

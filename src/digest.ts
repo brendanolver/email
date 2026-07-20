@@ -8,7 +8,14 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { fetchAllAccountsSince, listInboxMessageIds, loadAccounts, type NormalisedEmail, type MailboxSource } from "./imap.js";
+import {
+  fetchAllAccountsSince,
+  listInboxMessageIds,
+  loadAccounts,
+  MAX_LOOKBACK_DAYS,
+  type NormalisedEmail,
+  type MailboxSource,
+} from "./imap.js";
 import { deleteMessageById, flagMessageById, markAllSeenInSpecialUse } from "./imap-write.js";
 import {
   readCheckpoint,
@@ -20,12 +27,14 @@ import {
   getDigestRotation,
   setDigestRotation,
   readDomainRules,
-  TRACKING_WINDOW_DAYS,
+  cacheDigestItems,
+  pruneAndGetCarryForward,
   type UnsubscribeCandidate,
+  type CachedDigestItem,
 } from "./store.js";
 import { sendDigestEmail } from "./mailer.js";
 import { sendDigestSlack } from "./slack.js";
-import { renderHtml, renderPlainText, type StructuredDigest } from "./render.js";
+import { renderHtml, renderPlainText, type StructuredDigest, type DigestItem } from "./render.js";
 
 const MODEL = process.env.DIGEST_MODEL ?? "claude-haiku-4-5-20251001";
 
@@ -47,6 +56,7 @@ const BASE_BRIEF = `You are Brendan's executive email assistant. You'll be given
 - Where a reply is appropriate, draft it concisely and professionally in Brendan's voice, but never imply it has been sent — it's a draft for his review only.
 - The goal is filtering signal from noise: if 20 emails arrived and only 3 matter, surface only those 3 prominently.
 - If nothing in the batch is worth surfacing, say so briefly via the headline field and return empty sections rather than padding out a report.
+- Every item MUST include a messageId field, copied EXACTLY (character for character) from the "messageId" field of the corresponding email in the input JSON. Never invent, alter, or omit it — it's used to track the item across future digests, not shown to Brendan.
 - Call the submit_digest tool exactly once with the full structured result. Do not respond in plain text.`;
 
 // Forces Claude to return validated structured data instead of freeform
@@ -73,6 +83,10 @@ const SUBMIT_DIGEST_TOOL: Anthropic.Tool = {
               items: {
                 type: "object",
                 properties: {
+                  messageId: {
+                    type: "string",
+                    description: "Copied exactly from the corresponding input email's messageId field. Not shown to Brendan — used internally to track this item across future digests.",
+                  },
                   from: { type: "string" },
                   summary: { type: "string" },
                   whyItMatters: { type: "string" },
@@ -80,7 +94,7 @@ const SUBMIT_DIGEST_TOOL: Anthropic.Tool = {
                   priority: { type: "string", enum: ["Today", "This Week", "Can Wait"] },
                   draftReply: { type: "string", description: "Optional draft reply text." },
                 },
-                required: ["from", "summary", "whyItMatters", "recommendedAction", "priority"],
+                required: ["messageId", "from", "summary", "whyItMatters", "recommendedAction", "priority"],
               },
             },
           },
@@ -100,20 +114,9 @@ export interface DigestResult {
   html: string;
 }
 
-function emptyDigestResult(
-  since: Date,
-  until: Date,
-  headline: string,
-  unsubscribeSuggestions: UnsubscribeCandidate[]
-): DigestResult {
-  const structured: StructuredDigest = { sections: [], headline, unsubscribeSuggestions };
-  return {
-    since,
-    until,
-    emailCount: 0,
-    text: renderPlainText(structured),
-    html: renderHtml(structured),
-  };
+/** What Claude actually returns per item — includes messageId, which render.ts's DigestItem deliberately doesn't declare (it's plumbing, never rendered). */
+interface RawDigestItem extends DigestItem {
+  messageId: string;
 }
 
 function extractDomain(from: string): string | null {
@@ -191,35 +194,71 @@ async function applyDomainRules(emails: NormalisedEmail[]): Promise<DomainRuleOu
 }
 
 /**
- * Deletion-tracking pass: runs every cycle regardless of whether new
- * mail arrived. Compares what we've previously tracked against what's
- * actually still in each mailbox's INBOX right now (read-only diff),
- * then returns any senders that just crossed the unsubscribe
- * threshold for the first time.
+ * One presence-check per account per cycle, shared by two different
+ * consumers with two different needs: sender-deletion tracking (which
+ * only cares about the last TRACKING_WINDOW_DAYS) and digest
+ * carry-forward (which needs to know about anything still in the
+ * inbox up to MAX_LOOKBACK_DAYS back, un-windowed by intent — see
+ * store.ts). Computing this once and reusing it for both avoids a
+ * duplicate IMAP round-trip per account per cycle. A wider window here
+ * than either consumer strictly needs is always safe: an entry either
+ * consumer cares about that's genuinely still present will always be
+ * found; the narrower TRACKING_WINDOW_DAYS logic in diffTrackedAgainstCurrent
+ * only ever looks at its own tracked entries' age, not this window's size.
  *
- * This whole pass is best-effort and non-fatal by design: it's a
- * nice-to-have layered on top of the core digest, not something a
- * transient IMAP hiccup (timeout, brief auth blip) should be able to
- * take down the whole process for. Every other IMAP write op in this
- * codebase is individually wrapped the same way — this one wasn't,
- * and an unguarded rejection here is a plausible cause of a crash
- * observed in production.
+ * Best-effort per account: if one account's check fails, its mailbox
+ * is simply left out of the map rather than failing the whole cycle —
+ * store.ts treats a missing mailbox as "unknown", never as "gone",
+ * so a transient failure here can never look like Brendan deleted
+ * or moved something he didn't.
  */
-async function runDeletionTracking(): Promise<UnsubscribeCandidate[]> {
-  try {
-    const accounts = loadAccounts();
-    const trackingSince = new Date(Date.now() - TRACKING_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+async function computeCurrentInboxIds(): Promise<Partial<Record<MailboxSource, Set<string>>>> {
+  const accounts = loadAccounts();
+  const presenceSince = new Date(Date.now() - MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+  const currentIdsByMailbox: Partial<Record<MailboxSource, Set<string>>> = {};
 
-    const currentIdsByMailbox: Partial<Record<MailboxSource, Set<string>>> = {};
-    for (const account of accounts) {
-      currentIdsByMailbox[account.source] = await listInboxMessageIds(account, trackingSince);
+  for (const account of accounts) {
+    try {
+      currentIdsByMailbox[account.source] = await listInboxMessageIds(account, presenceSince);
+    } catch (err) {
+      console.error(`[digest] presence check failed for ${account.source} — leaving it out of this cycle's diff:`, err);
     }
+  }
 
+  return currentIdsByMailbox;
+}
+
+/**
+ * Sender-deletion tracking: compares tracked messages against what's
+ * currently present, then returns any senders that just crossed the
+ * unsubscribe threshold for the first time. Best-effort/non-fatal —
+ * see the comment history in this file for why (a crash was traced
+ * to an unguarded version of this).
+ */
+async function computeUnsubscribeSuggestions(
+  currentIdsByMailbox: Partial<Record<MailboxSource, Set<string>>>
+): Promise<UnsubscribeCandidate[]> {
+  try {
     await diffTrackedAgainstCurrent(currentIdsByMailbox);
     return await takeUnsuggestedCandidates();
   } catch (err) {
     console.error("[digest] deletion tracking failed — skipping unsubscribe suggestions this cycle:", err);
     return [];
+  }
+}
+
+/** Merges cached carry-forward items into the matching section, creating the section if this cycle had no new items in it. */
+function mergeCarryForward(
+  structured: StructuredDigest,
+  carryForward: { messageId: string; cached: CachedDigestItem }[]
+): void {
+  for (const { cached } of carryForward) {
+    let section = structured.sections.find((s) => s.name === cached.section);
+    if (!section) {
+      section = { name: cached.section, items: [] };
+      structured.sections.push(section);
+    }
+    section.items.push({ ...(cached.item as unknown as DigestItem), carriedOver: true });
   }
 }
 
@@ -243,47 +282,85 @@ export async function runDigest(): Promise<DigestResult> {
   }
 
   // Track every email we've seen (for deletion-detection) regardless
-  // of whether it ends up in this digest, then check whether anything
-  // previously tracked has vanished since we last looked.
+  // of whether it ends up in this digest.
   await recordTrackedMessages(emails);
-  const unsubscribeSuggestions = await runDeletionTracking();
+
+  const currentIdsByMailbox = await computeCurrentInboxIds();
+  const unsubscribeSuggestions = await computeUnsubscribeSuggestions(currentIdsByMailbox);
+
+  // Only genuinely new mail goes to Claude — carry-forward items are
+  // re-rendered from cache below, never re-categorised, so API cost
+  // stays bounded by new-mail volume regardless of how much sits
+  // unresolved in the inbox over time.
+  let structured: StructuredDigest;
+  const emailByMessageId = new Map(emails.map((e) => [e.messageId, e]));
 
   if (emails.length === 0) {
-    await writeCheckpoint(until);
-    return emptyDigestResult(since, until, "No new emails since the last check.", unsubscribeSuggestions);
+    structured = { sections: [], headline: "No new emails since the last check." };
+  } else {
+    const rules = await readRules();
+    const rulesBlock =
+      rules.length > 0
+        ? `\n\nBrendan's explicit preference rules (apply these when categorising):\n${rules.map((r) => `- ${r}`).join("\n")}`
+        : "";
+
+    const anthropic = new Anthropic(); // reads ANTHROPIC_API_KEY from env
+
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 4000,
+      system: BASE_BRIEF + rulesBlock,
+      tools: [SUBMIT_DIGEST_TOOL],
+      tool_choice: { type: "tool", name: "submit_digest" },
+      messages: [
+        {
+          role: "user",
+          content: `Here are ${emails.length} new emails since ${since.toISOString()}:\n\n${JSON.stringify(emails, null, 2)}`,
+        },
+      ],
+    });
+
+    const toolUse = response.content.find(
+      (block): block is Anthropic.ToolUseBlock => block.type === "tool_use" && block.name === "submit_digest"
+    );
+
+    if (!toolUse) {
+      throw new Error("Anthropic response did not include the expected submit_digest tool call.");
+    }
+
+    structured = toolUse.input as StructuredDigest;
   }
 
-  const rules = await readRules();
-  const rulesBlock =
-    rules.length > 0
-      ? `\n\nBrendan's explicit preference rules (apply these when categorising):\n${rules.map((r) => `- ${r}`).join("\n")}`
-      : "";
-
-  const anthropic = new Anthropic(); // reads ANTHROPIC_API_KEY from env
-
-  const response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 4000,
-    system: BASE_BRIEF + rulesBlock,
-    tools: [SUBMIT_DIGEST_TOOL],
-    tool_choice: { type: "tool", name: "submit_digest" },
-    messages: [
-      {
-        role: "user",
-        content: `Here are ${emails.length} new emails since ${since.toISOString()}:\n\n${JSON.stringify(emails, null, 2)}`,
-      },
-    ],
-  });
-
-  const toolUse = response.content.find(
-    (block): block is Anthropic.ToolUseBlock => block.type === "tool_use" && block.name === "submit_digest"
-  );
-
-  if (!toolUse) {
-    throw new Error("Anthropic response did not include the expected submit_digest tool call.");
+  // Cache this cycle's new items (keyed by the messageId Claude echoed
+  // back) so they can be carried forward in future cycles for as long
+  // as they're still physically sitting in the inbox.
+  const cacheEntries: Record<string, CachedDigestItem> = {};
+  const newMessageIds = new Set<string>();
+  for (const section of structured.sections) {
+    for (const rawItem of section.items as RawDigestItem[]) {
+      if (!rawItem.messageId) continue; // shouldn't happen given the required schema field, but never let a malformed item crash the cycle
+      newMessageIds.add(rawItem.messageId);
+      const email = emailByMessageId.get(rawItem.messageId);
+      if (email) {
+        cacheEntries[rawItem.messageId] = {
+          mailbox: email.mailbox,
+          section: section.name,
+          item: rawItem as unknown as Record<string, unknown>,
+        };
+      }
+    }
   }
+  await cacheDigestItems(cacheEntries);
 
-  const structured = toolUse.input as StructuredDigest;
+  // Anything cached from an earlier cycle that's still physically in
+  // the inbox — and wasn't already included as "new" above — gets
+  // carried forward into this digest too. This is the behaviour
+  // Brendan asked for explicitly: an email still sitting in the inbox
+  // deserves to keep appearing until it's moved or deleted, not drop
+  // off once it's no longer "new".
+  const carryForward = await pruneAndGetCarryForward(currentIdsByMailbox, newMessageIds);
+  mergeCarryForward(structured, carryForward);
+
   // Deterministic, code-computed — never generated by Claude, attached
   // here rather than asked for in the tool schema.
   structured.unsubscribeSuggestions = unsubscribeSuggestions;

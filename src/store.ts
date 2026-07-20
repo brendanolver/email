@@ -130,8 +130,17 @@ export async function removeDomainRule(domain: string): Promise<DomainRule[]> {
  *    sit in the inbox, never a stale unflagged one deleted by mistake.
  *  - tracked: every inbox message we've seen, so a future run can tell
  *    whether it later vanished (deleted/moved) — read-only to compute.
+ *    Windowed (TRACKING_WINDOW_DAYS) — this is a recent-behaviour
+ *    signal, not something that needs to persist indefinitely.
  *  - senderDeletions: counts per sender, feeding the "frequently
  *    deleted, consider unsubscribing" suggestions surfaced in the digest.
+ *  - digestCache: every item Claude has categorised, keyed by
+ *    Message-ID, with NO time-based expiry — added 2026-07-21 so an
+ *    item that's still physically sitting in the inbox keeps
+ *    reappearing in the digest until it's moved or deleted, however
+ *    long that takes, rather than silently dropping off once it's no
+ *    longer "new". Pruned only when the message is confirmed gone
+ *    from its mailbox's INBOX, never by age.
  */
 interface TrackedMessage {
   mailbox: MailboxSource;
@@ -149,15 +158,24 @@ interface SenderDeletionRecord {
   suggested: boolean;
 }
 
+export interface CachedDigestItem {
+  mailbox: MailboxSource;
+  section: string;
+  // Deliberately untyped/opaque here (store.ts shouldn't need to know
+  // the exact shape of a digest item) — digest.ts owns that type.
+  item: Record<string, unknown>;
+}
+
 interface DigestState {
   flagCandidateId?: string; // sent last cycle — flag it now, it's had time to land
   deleteCandidateId?: string; // sent 2 cycles ago — already flagged, safe to remove
   tracked: Record<string, TrackedMessage>; // key: Message-ID
   senderDeletions: Record<string, SenderDeletionRecord>; // key: normalised sender address
+  digestCache: Record<string, CachedDigestItem>; // key: Message-ID, no expiry
 }
 
 function defaultState(): DigestState {
-  return { tracked: {}, senderDeletions: {} };
+  return { tracked: {}, senderDeletions: {}, digestCache: {} };
 }
 
 async function readState(): Promise<DigestState> {
@@ -296,4 +314,50 @@ export async function takeUnsuggestedCandidates(): Promise<UnsubscribeCandidate[
 
   if (candidates.length > 0) await writeState(state);
   return candidates;
+}
+
+/** Caches this cycle's categorised items, keyed by Message-ID, for future carry-forward. Overwrites any existing cache entry for the same id. */
+export async function cacheDigestItems(entries: Record<string, CachedDigestItem>): Promise<void> {
+  if (Object.keys(entries).length === 0) return;
+  const state = await readState();
+  Object.assign(state.digestCache, entries);
+  await writeState(state);
+}
+
+export interface CarryForwardEntry {
+  messageId: string;
+  cached: CachedDigestItem;
+}
+
+/**
+ * Returns cached items that are still physically present in their
+ * mailbox's INBOX and weren't already included as "new" this cycle
+ * (via excludeMessageIds), pruning anything no longer present as a
+ * side effect. If a mailbox is missing from currentIdsByMailbox
+ * (e.g. that account's presence-check failed this cycle), its cached
+ * items are left untouched rather than assumed gone — a failed check
+ * should never look like "Brendan moved this", only a confirmed one.
+ */
+export async function pruneAndGetCarryForward(
+  currentIdsByMailbox: Partial<Record<MailboxSource, Set<string>>>,
+  excludeMessageIds: Set<string>
+): Promise<CarryForwardEntry[]> {
+  const state = await readState();
+  const carryForward: CarryForwardEntry[] = [];
+
+  for (const [messageId, cached] of Object.entries(state.digestCache)) {
+    const currentIds = currentIdsByMailbox[cached.mailbox];
+
+    if (currentIds && !currentIds.has(messageId)) {
+      delete state.digestCache[messageId];
+      continue;
+    }
+
+    if (!excludeMessageIds.has(messageId)) {
+      carryForward.push({ messageId, cached });
+    }
+  }
+
+  await writeState(state);
+  return carryForward;
 }
