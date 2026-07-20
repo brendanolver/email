@@ -5,6 +5,13 @@
  * controlled test conditions (see architecture doc §2 for the test
  * protocol). Do not change the readOnly/EXAMINE behaviour below without
  * re-running that same verification.
+ *
+ * Everything in this file stays read-only (EXAMINE, never SELECT).
+ * As of 2026-07-21 the connector also has a small, separate set of
+ * write operations — see imap-write.ts — added deliberately and only
+ * after Brendan explicitly approved write access. Keeping them in a
+ * different file means this file's read-only guarantee stays true by
+ * inspection, not just by convention.
  */
 
 import { ImapFlow, type FetchMessageObject } from "imapflow";
@@ -21,6 +28,8 @@ export interface NormalisedEmail {
   subject: string;
   receivedAt: string;
   bodyText: string;
+  /** Raw List-Unsubscribe header, if present — e.g. "<https://...>, <mailto:...>". */
+  listUnsubscribe?: string;
 }
 
 export interface Account {
@@ -104,6 +113,9 @@ export async function fetchSince(account: Account, sinceExact: Date): Promise<No
         if (!message.source) continue;
         const parsed = await simpleParser(message.source);
 
+        const listUnsubscribeHeader = parsed.headers.get("list-unsubscribe");
+        const listUnsubscribe = typeof listUnsubscribeHeader === "string" ? listUnsubscribeHeader : undefined;
+
         results.push({
           mailbox: account.source,
           messageId: parsed.messageId ?? message.envelope?.messageId ?? `no-id-${message.uid}`,
@@ -118,6 +130,7 @@ export async function fetchSince(account: Account, sinceExact: Date): Promise<No
           receivedAt: receivedAt.toISOString(),
           // TODO Stage 3: fall back to stripped HTML if plain text part is absent
           bodyText: cleanBodyText(parsed.text ?? ""),
+          listUnsubscribe,
         });
       }
     } finally {
@@ -198,6 +211,47 @@ export function dedupe(emails: NormalisedEmail[]): NormalisedEmail[] {
     out.push(email);
   }
   return out;
+}
+
+/**
+ * Lightweight, read-only (EXAMINE) listing of Message-IDs currently
+ * present in INBOX since a given date — envelope only, no body fetch
+ * or parsing. Used purely to detect when a previously-seen message
+ * has vanished (deleted or moved elsewhere) between digest runs.
+ */
+export async function listInboxMessageIds(account: Account, since: Date): Promise<Set<string>> {
+  const client = new ImapFlow({
+    host: account.host,
+    port: account.port,
+    secure: true,
+    auth: { user: account.user, pass: account.pass },
+    logger: false,
+  });
+
+  const ids = new Set<string>();
+
+  await client.connect();
+  try {
+    const lock = await client.getMailboxLock("INBOX", { readOnly: true });
+    try {
+      const searchDateOnly = new Date(since);
+      searchDateOnly.setHours(0, 0, 0, 0);
+
+      const uids = await client.search({ since: searchDateOnly }, { uid: true });
+      if (!uids || uids.length === 0) return ids;
+
+      for await (const message of client.fetch(uids, { envelope: true }, { uid: true }) as AsyncIterable<FetchMessageObject>) {
+        const messageId = message.envelope?.messageId;
+        if (messageId) ids.add(messageId);
+      }
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await client.logout();
+  }
+
+  return ids;
 }
 
 export async function fetchAllAccountsSince(since: Date): Promise<NormalisedEmail[]> {
