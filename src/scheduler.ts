@@ -13,7 +13,7 @@
  */
 
 import cron from "node-cron";
-import { runDigestAndDeliver } from "./digest.js";
+import { runDigestAndDeliver, runUnsubscribeDigestAndDeliver } from "./digest.js";
 
 const TIMEZONE = "Australia/Melbourne";
 
@@ -33,12 +33,30 @@ async function runAndDeliver(label: string): Promise<void> {
   }
 }
 
+async function runWeeklyUnsubscribeDigest(): Promise<void> {
+  console.log("[scheduler] weekly unsubscribe-suggestions run starting");
+  try {
+    const result = await runUnsubscribeDigestAndDeliver();
+    if (result.error) {
+      console.error("[scheduler] weekly unsubscribe-suggestions send failed:", result.error);
+    } else {
+      console.log(`[scheduler] weekly unsubscribe-suggestions run complete — ${result.sent ? `sent (${result.count})` : "nothing to send"}`);
+    }
+  } catch (err) {
+    console.error("[scheduler] weekly unsubscribe-suggestions run failed:", err);
+  }
+}
+
 export function startScheduler(): void {
   // Weekdays, hourly, 8am-6pm
   cron.schedule("0 8-18 * * 1-5", () => runAndDeliver("weekday"), { timezone: TIMEZONE });
 
   // Weekends, 9am/12pm/3pm/6pm
   cron.schedule("0 9,12,15,18 * * 0,6", () => runAndDeliver("weekend"), { timezone: TIMEZONE });
+
+  // Unsubscribe suggestions, moved out of the hourly digest — Monday
+  // 8am, matches the start of Brendan's weekday active hours.
+  cron.schedule("0 8 * * 1", () => runWeeklyUnsubscribeDigest(), { timezone: TIMEZONE });
 
   console.log(`[scheduler] started (timezone: ${TIMEZONE})`);
 }

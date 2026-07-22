@@ -67,7 +67,11 @@ export async function addRule(rule: string): Promise<string[]> {
  * cycle, before Claude ever sees the message, so they're matched by
  * exact domain string in code, never by LLM interpretation.
  */
-export type DomainRuleAction = "auto-mark-read" | "auto-delete";
+// "exclude" added 2026-07-21: the non-destructive option — the email
+// is filtered out of the digest entirely but otherwise left completely
+// untouched (not deleted, not marked read, no mailbox write at all).
+// Distinct from "auto-delete" (which actually removes the message).
+export type DomainRuleAction = "auto-mark-read" | "auto-delete" | "exclude";
 
 export interface DomainRule {
   domain: string; // lowercase, no leading "@"
@@ -172,10 +176,15 @@ interface DigestState {
   tracked: Record<string, TrackedMessage>; // key: Message-ID
   senderDeletions: Record<string, SenderDeletionRecord>; // key: normalised sender address
   digestCache: Record<string, CachedDigestItem>; // key: Message-ID, no expiry
+  // Accumulates between weekly unsubscribe-suggestion sends (added
+  // 2026-07-21, moved out of the main hourly digest per Brendan's
+  // request). Detection still runs every digest cycle as before —
+  // only *delivery* moved to a separate weekly cadence.
+  pendingUnsubscribeSuggestions: UnsubscribeCandidate[];
 }
 
 function defaultState(): DigestState {
-  return { tracked: {}, senderDeletions: {}, digestCache: {} };
+  return { tracked: {}, senderDeletions: {}, digestCache: {}, pendingUnsubscribeSuggestions: [] };
 }
 
 async function readState(): Promise<DigestState> {
@@ -314,6 +323,23 @@ export async function takeUnsuggestedCandidates(): Promise<UnsubscribeCandidate[
 
   if (candidates.length > 0) await writeState(state);
   return candidates;
+}
+
+/** Adds newly-suggested candidates to the pending queue, to be delivered by the next weekly unsubscribe-suggestions send. */
+export async function appendPendingUnsubscribeSuggestions(candidates: UnsubscribeCandidate[]): Promise<void> {
+  if (candidates.length === 0) return;
+  const state = await readState();
+  state.pendingUnsubscribeSuggestions.push(...candidates);
+  await writeState(state);
+}
+
+/** Drains and returns everything accumulated since the last weekly send. */
+export async function takeAllPendingUnsubscribeSuggestions(): Promise<UnsubscribeCandidate[]> {
+  const state = await readState();
+  const pending = state.pendingUnsubscribeSuggestions;
+  state.pendingUnsubscribeSuggestions = [];
+  await writeState(state);
+  return pending;
 }
 
 /** Caches this cycle's categorised items, keyed by Message-ID, for future carry-forward. Overwrites any existing cache entry for the same id. */

@@ -24,7 +24,7 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import * as z from "zod/v4";
 import { fetchAllAccountsSince, MAX_LOOKBACK_DAYS } from "./imap.js";
 import { addRule, readRules, addDomainRule, removeDomainRule, readDomainRules } from "./store.js";
-import { runDigestAndDeliver } from "./digest.js";
+import { runDigestAndDeliver, runUnsubscribeDigestAndDeliver } from "./digest.js";
 import { startScheduler } from "./scheduler.js";
 
 function requireEnv(name: string): string {
@@ -163,14 +163,16 @@ function buildMcpServer(): McpServer {
         `Adds a deterministic, code-enforced rule applied to every new email from a given domain, every digest cycle: ` +
         `"auto-mark-read" marks matching mail \\Seen but still includes it in the digest normally; ` +
         `"auto-delete" deletes matching mail from the mailbox immediately and excludes it from the digest entirely, ` +
-        `before Claude ever sees it. This is separate from add_preference_rule (which only ever affects how Claude ` +
-        `categorises mail) — these are hard actions on the mailbox itself, matched by exact domain, never by LLM ` +
-        `interpretation. Does NOT cover unsubscribing — that always stays a suggestion Brendan actions himself. ` +
-        `Re-adding a domain replaces its existing rule.`,
+        `before Claude ever sees it; "exclude" is non-destructive — filters matching mail out of the digest same as ` +
+        `auto-delete, but performs no mailbox write at all, the email is left completely untouched (not deleted, not ` +
+        `marked read). This is separate from add_preference_rule (which only ever affects how Claude categorises ` +
+        `mail) — these are hard, code-matched-by-exact-domain rules, never LLM interpretation. Does NOT cover ` +
+        `unsubscribing — that always stays a suggestion Brendan actions himself. Re-adding a domain replaces its ` +
+        `existing rule.`,
       inputSchema: {
         domain: z.string().describe("Domain to match, e.g. 'newsletter-domain.com' (a leading @ is fine too)"),
         action: z
-          .enum(["auto-mark-read", "auto-delete"])
+          .enum(["auto-mark-read", "auto-delete", "exclude"])
           .describe("What to do with every new email from this domain, every cycle"),
       },
     },
@@ -274,6 +276,42 @@ function buildMcpServer(): McpServer {
         return {
           isError: true,
           content: [{ type: "text", text: `Digest run failed: ${err instanceof Error ? err.message : String(err)}` }],
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "run_unsubscribe_digest_now",
+    {
+      title: "Send the weekly unsubscribe-suggestions email immediately",
+      description:
+        `Manually triggers the weekly unsubscribe-suggestions email outside its normal Monday schedule — drains ` +
+        `whatever's accumulated since the last send. Reports whether anything was actually sent (skips silently ` +
+        `if nothing has crossed the deletion threshold yet). Useful for testing without waiting a week.`,
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const result = await runUnsubscribeDigestAndDeliver();
+        if (result.error) {
+          return { isError: true, content: [{ type: "text", text: `Send failed: ${result.error}` }] };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: result.sent
+                ? `Sent — ${result.count} sender(s) suggested for unsubscribing.`
+                : "Nothing to send — no senders have crossed the deletion threshold since the last send.",
+            },
+          ],
+        };
+      } catch (err) {
+        console.error("[run_unsubscribe_digest_now] failed:", err);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Run failed: ${err instanceof Error ? err.message : String(err)}` }],
         };
       }
     }

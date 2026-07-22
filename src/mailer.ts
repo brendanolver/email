@@ -48,3 +48,31 @@ export async function sendDigestEmail(subject: string, bodyText: string, bodyHtm
 
   return { messageId: info.messageId };
 }
+
+/**
+ * Sends the weekly unsubscribe-suggestions email — deliberately no
+ * Importance/X-Priority headers, unlike sendDigestEmail. This isn't
+ * urgent content and shouldn't compete visually with the real digest.
+ */
+export async function sendUnsubscribeSuggestionsEmail(subject: string, bodyText: string, bodyHtml: string): Promise<{ messageId: string }> {
+  const user = requireEnv("ICLOUD_USERNAME");
+  const pass = requireEnv("ICLOUD_APP_PASSWORD");
+  const to = process.env.DIGEST_EMAIL_TO ?? user;
+
+  const transporter = nodemailer.createTransport({
+    host: "smtp.mail.me.com",
+    port: 587,
+    secure: false,
+    auth: { user, pass },
+  });
+
+  const info = await transporter.sendMail({
+    from: user,
+    to,
+    subject,
+    text: bodyText,
+    html: bodyHtml,
+  });
+
+  return { messageId: info.messageId };
+}
