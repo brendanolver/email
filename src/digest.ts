@@ -12,7 +12,6 @@ import {
   fetchAllAccountsSince,
   listInboxMessageIds,
   loadAccounts,
-  MAX_LOOKBACK_DAYS,
   type NormalisedEmail,
   type MailboxSource,
 } from "./imap.js";
@@ -193,18 +192,29 @@ async function applyDomainRules(emails: NormalisedEmail[]): Promise<DomainRuleOu
   return { kept, markedReadCount, deletedCount };
 }
 
+// How far back the "is this still in the inbox" presence-check looks
+// for carry-forward purposes. Deliberately separate from imap.ts's
+// MAX_LOOKBACK_DAYS (30), which caps how far the *new-mail* fetch can
+// ever reach from a checkpoint — that's a different safety concern
+// (guards against a corrupted/very old checkpoint triggering a huge
+// scan) and widening it would be the wrong lever to pull here.
+// Widened from 30 to 90 days on 2026-07-21 at Brendan's request — his
+// inbox holds onto unresolved items longer than a month.
+const CARRY_FORWARD_LOOKBACK_DAYS = 90;
+
 /**
  * One presence-check per account per cycle, shared by two different
  * consumers with two different needs: sender-deletion tracking (which
  * only cares about the last TRACKING_WINDOW_DAYS) and digest
  * carry-forward (which needs to know about anything still in the
- * inbox up to MAX_LOOKBACK_DAYS back, un-windowed by intent — see
- * store.ts). Computing this once and reusing it for both avoids a
- * duplicate IMAP round-trip per account per cycle. A wider window here
- * than either consumer strictly needs is always safe: an entry either
- * consumer cares about that's genuinely still present will always be
- * found; the narrower TRACKING_WINDOW_DAYS logic in diffTrackedAgainstCurrent
- * only ever looks at its own tracked entries' age, not this window's size.
+ * inbox up to CARRY_FORWARD_LOOKBACK_DAYS back, un-windowed by intent
+ * beyond that cap — see store.ts). Computing this once and reusing it
+ * for both avoids a duplicate IMAP round-trip per account per cycle.
+ * A wider window here than either consumer strictly needs is always
+ * safe: an entry either consumer cares about that's genuinely still
+ * present will always be found; the narrower TRACKING_WINDOW_DAYS
+ * logic in diffTrackedAgainstCurrent only ever looks at its own
+ * tracked entries' age, not this window's size.
  *
  * Best-effort per account: if one account's check fails, its mailbox
  * is simply left out of the map rather than failing the whole cycle —
@@ -214,7 +224,7 @@ async function applyDomainRules(emails: NormalisedEmail[]): Promise<DomainRuleOu
  */
 async function computeCurrentInboxIds(): Promise<Partial<Record<MailboxSource, Set<string>>>> {
   const accounts = loadAccounts();
-  const presenceSince = new Date(Date.now() - MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+  const presenceSince = new Date(Date.now() - CARRY_FORWARD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
   const currentIdsByMailbox: Partial<Record<MailboxSource, Set<string>>> = {};
 
   for (const account of accounts) {
